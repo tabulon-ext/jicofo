@@ -30,6 +30,7 @@ import org.jivesoftware.smack.packet.*;
 import org.jxmpp.jid.*;
 
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
 
 import static org.apache.commons.lang3.StringUtils.*;
 
@@ -102,7 +103,8 @@ public class JibriSession
     /**
      * Reference to scheduled {@link PendingStatusTimeout}
      */
-    private ScheduledFuture<?> pendingTimeoutTask;
+    @NotNull
+    private final AtomicReference<ScheduledFuture<?>> pendingTimeoutTask = new AtomicReference<>();
 
     /**
      * How long this session can stay in "pending" status, before retry is made
@@ -143,11 +145,6 @@ public class JibriSession
     private final String applicationData;
 
     /**
-     * {@link AbstractXMPPConnection} instance used to send/listen for XMPP packets.
-     */
-    private final AbstractXMPPConnection xmpp;
-
-    /**
      * The maximum amount of retries we'll attempt
      */
     private final int maxNumRetries;
@@ -176,8 +173,6 @@ public class JibriSession
      * @param roomName the name if the XMPP MUC room (full address).
      * @param pendingTimeout how many seconds this session can wait in pending
      * state, before trying another Jibri instance or failing with an error.
-     * @param connection the XMPP connection which will be used to send/listen
-     * for packets.
      * @param jibriDetector the Jibri detector which will be used to select
      * Jibri instance.
      * @param isSIP <tt>true</tt> if it's a SIP session or <tt>false</tt> for
@@ -198,7 +193,6 @@ public class JibriSession
             Jid initiator,
             long pendingTimeout,
             int maxNumRetries,
-            AbstractXMPPConnection connection,
             JibriDetector jibriDetector,
             boolean isSIP,
             String sipAddress,
@@ -222,7 +216,6 @@ public class JibriSession
         this.youTubeBroadcastId = youTubeBroadcastId;
         this.sessionId = sessionId;
         this.applicationData = applicationData;
-        this.xmpp = connection;
         jibriDetector.addHandler(jibriEventHandler);
         logger = new LoggerImpl(getClass().getName(), logLevelDelegate.getLevel());
     }
@@ -370,7 +363,7 @@ public class JibriSession
         // in the processing of the response.
         try
         {
-            xmpp.sendIqWithResponseCallback(
+            jibriDetector.getXmppConnection().sendIqWithResponseCallback(
                     stopRequest,
                     stanza -> {
                         if (stanza instanceof JibriIq) {
@@ -394,7 +387,7 @@ public class JibriSession
                     60000);
         } catch (SmackException.NotConnectedException | InterruptedException e)
         {
-            logger.error("Error sending stop iq: " + e.toString());
+            logger.error("Error sending stop iq: " + e, e);
         }
     }
 
@@ -451,7 +444,7 @@ public class JibriSession
         }
         else
         {
-            logger.error("Received UNDEFINED status from jibri: " + iq.toString());
+            logger.error("Received UNDEFINED status from jibri: " + iq);
         }
     }
 
@@ -523,7 +516,7 @@ public class JibriSession
         // timeout each time.
         reschedulePendingTimeout();
 
-        IQ reply = UtilKt.sendIqAndGetResponse(xmpp, startIq);
+        IQ reply = UtilKt.sendIqAndGetResponse(jibriDetector.getXmppConnection(), startIq);
 
         if (!(reply instanceof JibriIq))
         {
@@ -558,19 +551,35 @@ public class JibriSession
      */
     private void reschedulePendingTimeout()
     {
-        if (pendingTimeoutTask != null)
-        {
-            logger.info(
-                "Rescheduling pending timeout task for room: " + roomName);
-            pendingTimeoutTask.cancel(false);
-        }
-
+        // If pendingTimeout <= 0, no tasks are ever scheduled, so there is nothing to cancel.
         if (pendingTimeout > 0)
         {
-            pendingTimeoutTask
-                = TaskPools.getScheduledPool().schedule(
-                        new PendingStatusTimeout(),
-                        pendingTimeout, TimeUnit.SECONDS);
+            ScheduledFuture<?> newTask
+                = TaskPools.getScheduledPool().schedule(new PendingStatusTimeout(), pendingTimeout, TimeUnit.SECONDS);
+            ScheduledFuture<?> oldTask = pendingTimeoutTask.getAndSet(newTask);
+            if (oldTask != null)
+            {
+                logger.info("Rescheduling pending timeout task for room: " + roomName);
+                oldTask.cancel(false);
+            }
+        }
+    }
+
+    /**
+     * Clear the pending timeout task.
+     *
+     * @param cancel whether to cancel the previous task if it exists.
+     */
+    private void clearPendingTimeout(boolean cancel)
+    {
+        ScheduledFuture<?> oldTask = pendingTimeoutTask.getAndSet(null);
+        if (cancel)
+        {
+            if (oldTask != null)
+            {
+                logger.info("Jibri is no longer pending, cancelling pending timeout task");
+                oldTask.cancel(false);
+            }
         }
     }
 
@@ -631,14 +640,13 @@ public class JibriSession
                     " but the current Jibri is " + currentJibriJid + ", ignoring");
             return;
         }
-        // First: if we're no longer pending (regardless of the Jibri's
-        // new state), make sure we stop the pending timeout task
-        if (pendingTimeoutTask != null && !Status.PENDING.equals(newStatus))
+        // First: if we're no longer pending (regardless of the Jibri's new state), make sure we stop the pending
+        // timeout task.
+        if (!Status.PENDING.equals(newStatus))
         {
-            logger.info("Jibri is no longer pending, cancelling pending timeout task");
-            pendingTimeoutTask.cancel(false);
-            pendingTimeoutTask = null;
+            clearPendingTimeout(true);
         }
+
         // Now, if there was a failure of any kind we'll try and find another
         // Jibri to keep things going
         if (failureReason != null)
@@ -741,12 +749,11 @@ public class JibriSession
             {
                 // Clear this task reference, so it won't be
                 // cancelling itself on status change from PENDING
-                pendingTimeoutTask = null;
+                clearPendingTimeout(false);
 
                 if (isStartingStatus(jibriStatus))
                 {
-                    logger.error(
-                        nickname() + " pending timeout! " + roomName);
+                    logger.error(nickname() + " pending timeout! " + roomName);
                     // If a Jibri times out during the pending phase, it's
                     // likely hung or having some issue.  We'll send a stop (so
                     // if/when it does 'recover', it knows to stop) and simulate
@@ -754,8 +761,7 @@ public class JibriSession
                     // JibriEventHandler#handleEvent when a Jibri goes offline)
                     // to trigger the fallback logic.
                     stop(null);
-                    handleJibriStatusUpdate(
-                        currentJibriJid, Status.OFF, FailureReason.ERROR, true);
+                    handleJibriStatusUpdate(currentJibriJid, Status.OFF, FailureReason.ERROR, true);
                 }
             }
         }
