@@ -1,0 +1,245 @@
+/*
+ * Jicofo, the Jitsi Conference Focus.
+ *
+ * Copyright @ 2020 - Present, 8x8 Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.jitsi.jicofo.jibri
+
+import io.kotest.assertions.throwables.shouldThrow
+import io.kotest.core.spec.IsolationMode
+import io.kotest.core.spec.style.ShouldSpec
+import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
+import io.mockk.every
+import io.mockk.mockk
+import io.mockk.mockkStatic
+import io.mockk.slot
+import io.mockk.verify
+import org.jitsi.jicofo.xmpp.RoomMetadata
+import org.jitsi.jicofo.xmpp.sendIqAndGetResponse
+import org.jitsi.utils.logging2.Logger
+import org.jitsi.utils.logging2.LoggerImpl
+import org.jitsi.xmpp.extensions.jibri.BadRequestPacketExt
+import org.jitsi.xmpp.extensions.jibri.JibriIq
+import org.jitsi.xmpp.extensions.jibri.RecordingParamsPacketExt
+import org.jivesoftware.smack.AbstractXMPPConnection
+import org.jivesoftware.smack.packet.IQ
+import org.jivesoftware.smack.packet.StanzaError
+import org.jxmpp.jid.impl.JidCreate
+
+class JibriSessionTest : ShouldSpec({
+    isolationMode = IsolationMode.InstancePerLeaf
+
+    val stateListener: JibriSession.StateListener = mockk(relaxed = true)
+    val roomName = JidCreate.entityBareFrom("room@bar.com/baz")
+    val initiator = JidCreate.bareFrom("foo@bar.com/baz")
+    val pendingTimeout = 60L
+    val maxNumRetries = 2
+    // Mock the AbstractXMPPConnection.sendPacketAndGetReply extension function.
+    mockkStatic("org.jitsi.jicofo.xmpp.UtilKt")
+    val mockXmppConnection: AbstractXMPPConnection = mockk()
+    val jibriList = mutableListOf(
+        JidCreate.bareFrom("jibri1@bar.com"),
+        JidCreate.bareFrom("jibri2@bar.com"),
+        JidCreate.bareFrom("jibri3@bar.com")
+    )
+    val detector: JibriDetector = mockk {
+        every { selectJibri() } returnsMany (jibriList)
+        every { isAnyInstanceConnected } returns true
+        every { xmppConnection } returns mockXmppConnection
+        every { addHandler(any()) } returns Unit
+        every { removeHandler(any()) } returns Unit
+        every { instanceFailed(any()) } returns Unit
+    }
+    val logger: Logger = LoggerImpl("JibriSessionTest")
+
+    fun createSession(recordingParams: RoomMetadata.Metadata.RecordingParams? = null) = JibriSession(
+        stateListener,
+        roomName,
+        initiator,
+        pendingTimeout,
+        maxNumRetries,
+        detector,
+        // isSIP
+        false,
+        // sipAddress
+        null,
+        "displayName",
+        "streamID",
+        "youTubeBroadcastId",
+        "sessionId",
+        "applicationData",
+        true,
+        recordingParams,
+        logger
+    )
+
+    val jibriSession = createSession()
+
+    context("When sending a request to a Jibri to start a session throws an error") {
+        val iqRequests = mutableListOf<IQ>()
+        every { mockXmppConnection.sendIqAndGetResponse(capture(iqRequests)) } answers {
+            // First return error
+            IQ.createErrorResponse(arg(1), StanzaError.Condition.service_unavailable)
+        } andThenAnswer {
+            // Then return a successful response
+            JibriIq().apply {
+                status = JibriIq.Status.PENDING
+                from = (arg(1) as IQ).to
+            }
+        }
+        context("Trying to start a Jibri session") {
+            should("retry with another jibri") {
+                jibriSession.start()
+                verify(exactly = 2) { mockXmppConnection.sendIqAndGetResponse(any()) }
+                iqRequests shouldHaveSize 2
+                iqRequests[0].to shouldNotBe iqRequests[1].to
+            }
+        }
+        context("and that's the only Jibri") {
+            every { detector.selectJibri() } returns JidCreate.bareFrom("solo@bar.com")
+            every { mockXmppConnection.sendIqAndGetResponse(capture(iqRequests)) } answers {
+                // First return error
+                IQ.createErrorResponse(arg(1), StanzaError.Condition.service_unavailable)
+            }
+            context("trying to start a jibri session") {
+                should("give up after exceeding the retry count") {
+                    shouldThrow<JibriSession.StartException> {
+                        jibriSession.start()
+                    }
+                    verify(exactly = maxNumRetries + 1) { mockXmppConnection.sendIqAndGetResponse(any()) }
+                }
+            }
+        }
+    }
+    context("Trying to start a session with a Jibri that is busy") {
+        val iq = slot<IQ>()
+        // First return busy, then pending
+        every { mockXmppConnection.sendIqAndGetResponse(capture(iq)) } answers {
+            JibriIq().apply {
+                type = IQ.Type.result
+                from = iq.captured.to
+                to = iq.captured.from
+                shouldRetry = true
+                status = JibriIq.Status.OFF
+                failureReason = JibriIq.FailureReason.BUSY
+            }
+        } andThenAnswer {
+            JibriIq().apply {
+                type = IQ.Type.result
+                from = iq.captured.to
+                to = iq.captured.from
+                shouldRetry = true
+                status = JibriIq.Status.PENDING
+            }
+        }
+        jibriSession.start()
+        should("retry with another jibri") {
+            verify(exactly = 2) { mockXmppConnection.sendIqAndGetResponse(any()) }
+        }
+    }
+    context("Trying to start a session with a Jibri that refuses the request as invalid") {
+        val iq = slot<IQ>()
+        every { mockXmppConnection.sendIqAndGetResponse(capture(iq)) } answers {
+            JibriIq().apply {
+                type = IQ.Type.result
+                from = iq.captured.to
+                to = iq.captured.from
+                shouldRetry = false
+                status = JibriIq.Status.OFF
+                failureReason = JibriIq.FailureReason.ERROR
+                addExtension(BadRequestPacketExt("The YouTube stream key has an invalid format"))
+            }
+        }
+        should("tell jibri that it understands a bad-request response") {
+            shouldThrow<JibriSession.StartException.NotRetryable> { jibriSession.start() }
+            (iq.captured as JibriIq).supportsBadRequest shouldBe true
+        }
+        should("fail without trying another jibri, and pass on the detail") {
+            val exc = shouldThrow<JibriSession.StartException.NotRetryable> { jibriSession.start() }
+            exc.message shouldBe "The YouTube stream key has an invalid format"
+            verify(exactly = 1) { mockXmppConnection.sendIqAndGetResponse(any()) }
+            verify(exactly = 0) { detector.instanceFailed(any()) }
+        }
+    }
+    context("Starting a session") {
+        val iq = slot<IQ>()
+        every { mockXmppConnection.sendIqAndGetResponse(capture(iq)) } answers {
+            JibriIq().apply {
+                type = IQ.Type.result
+                from = iq.captured.to
+                to = iq.captured.from
+                status = JibriIq.Status.PENDING
+            }
+        }
+        fun startedRequest() = iq.captured as JibriIq
+
+        should("pass on the recording parameters of the room") {
+            createSession(RoomMetadata.Metadata.RecordingParams("1280x720", 2, 3)).start()
+
+            val params = startedRequest().getExtension(RecordingParamsPacketExt::class.java)
+            params shouldNotBe null
+            params.tileResolution shouldBe "1280x720"
+            params.tileCount shouldBe 2
+            params.maxFullResolutionParticipants shouldBe 3
+        }
+        should("omit a parameter which the room does not set") {
+            // Jibri uses its own default for a parameter which is absent, so we must not send a value of our own.
+            createSession(RoomMetadata.Metadata.RecordingParams(tileCount = 2)).start()
+
+            val params = startedRequest().getExtension(RecordingParamsPacketExt::class.java)
+            params shouldNotBe null
+            params.tileCount shouldBe 2
+            params.tileResolution shouldBe null
+            params.maxFullResolutionParticipants shouldBe null
+        }
+        should("not add the element when the room has no recording parameters") {
+            createSession().start()
+
+            startedRequest().getExtension(RecordingParamsPacketExt::class.java) shouldBe null
+        }
+        should("not add the element when the room sets no parameter at all") {
+            createSession(RoomMetadata.Metadata.RecordingParams()).start()
+
+            startedRequest().getExtension(RecordingParamsPacketExt::class.java) shouldBe null
+        }
+    }
+    context("Trying to start a session with a Jibri that rejects the request and says not to retry") {
+        val iq = slot<IQ>()
+        every { mockXmppConnection.sendIqAndGetResponse(capture(iq)) } answers {
+            JibriIq().apply {
+                type = IQ.Type.result
+                from = iq.captured.to
+                to = iq.captured.from
+                shouldRetry = false
+                status = JibriIq.Status.OFF
+                failureReason = JibriIq.FailureReason.ERROR
+            }
+        }
+        should("fail without trying another jibri") {
+            shouldThrow<JibriSession.StartException.NotRetryable> {
+                jibriSession.start()
+            }
+            verify(exactly = 1) { mockXmppConnection.sendIqAndGetResponse(any()) }
+        }
+        should("not blame the jibri which rejected the request") {
+            shouldThrow<JibriSession.StartException.NotRetryable> {
+                jibriSession.start()
+            }
+            verify(exactly = 0) { detector.instanceFailed(any()) }
+        }
+    }
+})

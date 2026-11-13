@@ -1,0 +1,503 @@
+/*
+ * Jicofo, the Jitsi Conference Focus.
+ *
+ * Copyright @ 2015-Present 8x8, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.jitsi.jicofo.xmpp.jingle
+
+import com.fasterxml.jackson.databind.node.JsonNodeFactory
+import com.fasterxml.jackson.databind.node.ObjectNode
+import io.opentelemetry.api.trace.Span
+import io.opentelemetry.api.trace.SpanContext
+import io.opentelemetry.api.trace.StatusCode
+import io.opentelemetry.api.trace.TraceFlags
+import io.opentelemetry.api.trace.TraceState
+import io.opentelemetry.api.trace.Tracer
+import io.opentelemetry.context.Context
+import org.jitsi.jicofo.TaskPools
+import org.jitsi.jicofo.conference.source.ConferenceSourceMap
+import org.jitsi.jicofo.xmpp.IqProcessingResult
+import org.jitsi.jicofo.xmpp.createSessionInitiate
+import org.jitsi.jicofo.xmpp.createTransportReplace
+import org.jitsi.jicofo.xmpp.sendIqAndGetResponse
+import org.jitsi.jicofo.xmpp.tryToSendStanza
+import org.jitsi.tracing.TracingGlobal
+import org.jitsi.utils.MediaType
+import org.jitsi.utils.logging2.createLogger
+import org.jitsi.utils.queue.PacketQueue
+import org.jitsi.xmpp.extensions.TraceParent
+import org.jitsi.xmpp.extensions.jingle.ContentPacketExtension
+import org.jitsi.xmpp.extensions.jingle.GroupPacketExtension
+import org.jitsi.xmpp.extensions.jingle.IceUdpTransportPacketExtension
+import org.jitsi.xmpp.extensions.jingle.JingleAction
+import org.jitsi.xmpp.extensions.jingle.JingleIQ
+import org.jitsi.xmpp.extensions.jingle.JinglePacketFactory
+import org.jitsi.xmpp.extensions.jingle.Reason
+import org.jitsi.xmpp.extensions.jingle.RtpDescriptionPacketExtension
+import org.jitsi.xmpp.extensions.jitsimeet.ClientVersionPacketExtension
+import org.jitsi.xmpp.extensions.jitsimeet.JsonMessageExtension
+import org.jivesoftware.smack.AbstractXMPPConnection
+import org.jivesoftware.smack.SmackException
+import org.jivesoftware.smack.packet.ExtensionElement
+import org.jivesoftware.smack.packet.IQ
+import org.jivesoftware.smack.packet.StanzaError
+import org.jxmpp.jid.Jid
+import java.util.Objects
+
+/**
+ * Extracts a remote [Span] from the `traceparent` extension of an IQ, if present.
+ *
+ * Inlined from jicoco-tracing's TracingUtil, which was removed because it pulled in a Smack
+ * dependency that isn't available on Maven Central: https://github.com/jitsi/jicoco/pull/241
+ */
+private fun remoteSpanFromIq(iq: IQ): Span? {
+    val extension = iq.getExtension(TraceParent::class.java) ?: return null
+    return Span.wrap(
+        SpanContext.createFromRemoteParent(
+            extension.traceId,
+            extension.parentId,
+            TraceFlags.fromHex(extension.traceFlags, 0),
+            TraceState.getDefault()
+        )
+    )
+}
+
+/**
+ * Extracts a remote [Context] from the `traceparent` extension of an IQ, if present, or the root
+ * context otherwise.
+ */
+private fun remoteContextFromIq(iq: IQ): Context {
+    val root = Context.root()
+    val span = remoteSpanFromIq(iq) ?: return root
+    return root.with(span)
+}
+
+/**
+ * Class describes Jingle session.
+ *
+ * @author Pawel Domas
+ * @author Lyubomir Marinov
+ */
+class JingleSession(
+    /** Jingle session identifier. */
+    val sid: String,
+    /** Remote peer XMPP address. */
+    val remoteJid: Jid,
+    private val jingleIqRequestHandler: JingleIqRequestHandler,
+    private val connection: AbstractXMPPConnection,
+    private val requestHandler: JingleRequestHandler,
+    private val encodeSourcesAsJson: Boolean
+) {
+    /**
+     * Read and written from more than one thread: the IQ queue thread, [terminate], and the readers such as
+     * [isActive]. [Volatile] gives visibility only, the transitions are not atomic. For example, the IQ queue thread
+     * can set the state to ACTIVE after a concurrent [terminate]. The conference rejects such a session later, because
+     * it is no longer the current session of the participant.
+     */
+    @Volatile
+    private var state = State.PENDING
+    fun isActive() = state == State.ACTIVE
+
+    val logger = createLogger().apply {
+        addContext("remoteJid", remoteJid.toString())
+        addContext("sid", sid)
+    }
+    val tracer: Tracer = TracingGlobal.sdk.getTracer("org.jitsi.jicofo.jingle")
+
+    private val incomingIqQueue = PacketQueue<JingleIQ>(
+        Integer.MAX_VALUE,
+        true,
+        "jingle-iq-queue",
+        { iq ->
+            val span = tracer.spanBuilder("jingle.${iq.action}")
+                .setParent(remoteContextFromIq(iq))
+                .setAttribute("initiator.id", Objects.toString(iq.initiator))
+                .setAttribute("responder.id", Objects.toString(iq.responder))
+                .setAttribute("session.id", Objects.toString(iq.sid))
+                .startSpan()
+            try {
+                span.makeCurrent().use {
+                    doProcessIq(iq)
+                }
+            } catch (e: Throwable) {
+                span.setStatus(StatusCode.ERROR, e.message ?: "")
+                throw e
+            } finally {
+                span.end()
+            }
+            return@PacketQueue true
+        },
+        TaskPools.ioPool
+    )
+
+    private val localJid: Jid = connection.user
+
+    fun processIq(iq: JingleIQ): IqProcessingResult {
+        val action = iq.action
+            ?: return IqProcessingResult.RejectedWithError(
+                IQ.createErrorResponse(
+                    iq,
+                    StanzaError.getBuilder(StanzaError.Condition.bad_request)
+                        .setConditionText("Missing 'action'").build()
+                )
+            )
+        JingleStats.stanzaReceived(action)
+
+        if (state == State.ENDED) {
+            return IqProcessingResult.RejectedWithError(
+                IQ.createErrorResponse(
+                    iq,
+                    StanzaError.getBuilder(StanzaError.Condition.gone).setConditionText("session ended").build()
+                )
+            )
+        }
+
+        incomingIqQueue.add(iq)
+        return IqProcessingResult.AcceptedWithNoResponse()
+    }
+
+    /** The version of the client, if it included one in its session-accept. */
+    var clientVersion: String? = null
+        private set
+
+    private fun doProcessIq(iq: JingleIQ) {
+        if (state == State.ENDED) {
+            // The session ended while the IQ was queued.
+            logger.info("Ignoring ${iq.action}, the session has ended.")
+            connection.tryToSendStanza(
+                IQ.createErrorResponse(
+                    iq,
+                    StanzaError.getBuilder(StanzaError.Condition.gone).setConditionText("session ended").build()
+                )
+            )
+            return
+        }
+
+        val error = when (iq.action) {
+            JingleAction.SESSION_ACCEPT -> {
+                // The client includes its version in the session-accept that it sends to us.
+                iq.getExtension(ClientVersionPacketExtension::class.java)?.version?.let {
+                    clientVersion = it
+                    logger.info("Client version: $it")
+                }
+                // The session needs to be marked as active early to allow code executing as part of onSessionAccept
+                // to proceed (e.g. to signal source updates).
+                state = State.ACTIVE
+                val error = requestHandler.onSessionAccept(this, iq.contentList)
+                if (error != null) state = State.ENDED
+                error
+            }
+
+            JingleAction.SESSION_INFO -> requestHandler.onSessionInfo(this, iq)
+
+            JingleAction.SESSION_TERMINATE -> requestHandler.onSessionTerminate(this, iq).also {
+                state = State.ENDED
+            }
+
+            JingleAction.TRANSPORT_ACCEPT -> requestHandler.onTransportAccept(this, iq.contentList)
+
+            JingleAction.TRANSPORT_INFO -> requestHandler.onTransportInfo(this, iq.contentList)
+
+            JingleAction.TRANSPORT_REJECT -> {
+                requestHandler.onTransportReject(this, iq)
+                null
+            }
+
+            JingleAction.ADDSOURCE, JingleAction.SOURCEADD -> requestHandler.onAddSource(this, iq.contentList)
+
+            JingleAction.REMOVESOURCE, JingleAction.SOURCEREMOVE -> requestHandler.onRemoveSource(
+                this,
+                iq.contentList
+            )
+
+            else -> {
+                logger.warn("unsupported action ${iq.action}")
+                StanzaError.getBuilder(StanzaError.Condition.feature_not_implemented)
+                    .setConditionText("Unsupported 'action'").build()
+            }
+        }
+
+        val response = if (error == null) {
+            IQ.createResultIQ(iq)
+        } else {
+            logger.info("Returning error: request=${iq.toXML()}, error=${error.toXML()} ")
+            IQ.createErrorResponse(iq, error)
+        }
+        connection.tryToSendStanza(response)
+    }
+
+    fun terminate(
+        reason: Reason,
+        message: String?,
+        /** Whether to send a session-terminate IQ, or only terminate the session locally. */
+        sendIq: Boolean
+    ) {
+        logger.debug("Terminating session with $remoteJid, reason=$reason, sendIq=$sendIq")
+        val oldState = state
+        state = State.ENDED
+
+        if (oldState == State.ENDED) logger.warn("Terminating session which is already in state ENDED")
+
+        if (sendIq) {
+            if (oldState == State.ENDED) {
+                logger.warn("Not sending session-terminate for session in state $state")
+            } else {
+                val terminate = JinglePacketFactory.createSessionTerminate(
+                    localJid,
+                    remoteJid,
+                    sid,
+                    reason,
+                    message
+                )
+                connection.tryToSendStanza(terminate)
+                JingleStats.stanzaSent(JingleAction.SESSION_TERMINATE)
+            }
+        }
+
+        jingleIqRequestHandler.removeSession(this)
+    }
+
+    /**
+     * Send a transport-replace IQ and wait for a response. Return true if the response is successful, and false
+     * otherwise.
+     */
+    @Throws(SmackException.NotConnectedException::class)
+    fun replaceTransport(
+        contents: List<ContentPacketExtension>,
+        additionalExtensions: List<ExtensionElement>,
+        sources: ConferenceSourceMap
+    ): Boolean {
+        logger.info("Sending transport-replace, sources=$sources.")
+        if (state != State.ACTIVE) logger.error("Sending transport-replace for session in state $state")
+
+        val contentsWithSources = if (encodeSourcesAsJson) contents else sources.toContents(contents)
+        val jingleIq = createTransportReplace(localJid, this, contentsWithSources)
+
+        jingleIq.addExtension(GroupPacketExtension.createBundleGroup(jingleIq.contentList))
+        additionalExtensions.forEach { jingleIq.addExtension(it) }
+        if (encodeSourcesAsJson) {
+            jingleIq.addExtension(sources.toJsonMessageExtension())
+        }
+
+        JingleStats.stanzaSent(jingleIq.action)
+        val response = connection.sendIqAndGetResponse(jingleIq)
+        return if (response?.type == IQ.Type.result) {
+            true
+        } else {
+            logger.error("Unexpected response to transport-replace: ${response?.toXML()}")
+            false
+        }
+    }
+
+    /**
+     * Send a source-remove IQ with the specified sources. Returns immediately without waiting for a response.
+     */
+    fun removeSource(sourcesToRemove: ConferenceSourceMap) {
+        val removeSourceIq = JingleIQ(JingleAction.SOURCEREMOVE, sid).apply {
+            from = localJid
+            type = IQ.Type.set
+            to = remoteJid
+        }
+
+        if (encodeSourcesAsJson) {
+            removeSourceIq.addExtension(sourcesToRemove.toJsonMessageExtension())
+        } else {
+            sourcesToRemove.toJingle().forEach { removeSourceIq.addContent(it) }
+        }
+        logger.debug { "Sending source-remove, sources=$sourcesToRemove" }
+        checkStateForSourceUpdate("source-remove")
+        connection.tryToSendStanza(removeSourceIq)
+        JingleStats.stanzaSent(JingleAction.SOURCEREMOVE)
+    }
+
+    /**
+     * Send a transport-info IQ carrying the bridge's transport. Used after the bridge performed an ICE restart
+     * and rotated its ICE credentials: the client's connectivity checks are addressed to those credentials, so
+     * it has to be told the new ones. Returns immediately without waiting for a response.
+     *
+     * The transport is sent on a single content; the client applies the credentials to its whole (bundled)
+     * transport, so which content carries them does not matter.
+     */
+    fun sendTransportInfo(transport: IceUdpTransportPacketExtension) {
+        val transportInfoIq = JingleIQ(JingleAction.TRANSPORT_INFO, sid).apply {
+            from = localJid
+            type = IQ.Type.set
+            to = remoteJid
+            addContent(
+                ContentPacketExtension().apply {
+                    creator = ContentPacketExtension.CreatorEnum.initiator
+                    name = "audio"
+                    addChildExtension(IceUdpTransportPacketExtension.cloneTransportAndCandidates(transport, true))
+                }
+            )
+        }
+
+        logger.info(
+            "ICE restart: sending transport-info with the bridge's transport, generation=${transport.iceGeneration}, " +
+                "ufrag=${transport.ufrag}"
+        )
+        if (state != State.ACTIVE) logger.error("Sending transport-info for session in state $state")
+        connection.tryToSendStanza(transportInfoIq)
+        JingleStats.stanzaSent(JingleAction.TRANSPORT_INFO)
+    }
+
+    /**
+     * Send a source-add IQ with the specified sources. Returns immediately without waiting for a response.
+     */
+    fun addSource(sources: ConferenceSourceMap) {
+        logger.debug { "Sending source-add, sources=$sources" }
+        JingleStats.stanzaSent(JingleAction.SOURCEADD)
+        checkStateForSourceUpdate("source-add")
+        connection.tryToSendStanza(createAddSourceIq(sources))
+    }
+
+    /**
+     * Log if a source update is sent in a state other than ACTIVE. An ENDED session is not an error: the session can
+     * end while an update for it is already queued.
+     */
+    private fun checkStateForSourceUpdate(action: String) {
+        when (state) {
+            State.ACTIVE -> {}
+            State.ENDED -> logger.warn("Sending $action for session in state $state")
+            else -> logger.error("Sending $action for session in state $state")
+        }
+    }
+
+    @Throws(SmackException.NotConnectedException::class)
+    fun initiateSession(
+        contents: List<ContentPacketExtension>,
+        additionalExtensions: List<ExtensionElement>,
+        sources: ConferenceSourceMap,
+    ): Boolean {
+        if (state != State.PENDING) logger.error("Sending session-initiate for session in state $state")
+        val contentsWithSources = if (encodeSourcesAsJson) contents else sources.toContents(contents)
+        val sessionInitiate = createSessionInitiate(localJid, remoteJid, sid, contentsWithSources).apply {
+            addExtension(GroupPacketExtension.createBundleGroup(contentList))
+            additionalExtensions.forEach { addExtension(it) }
+            if (encodeSourcesAsJson) {
+                addExtension(sources.toJsonMessageExtension())
+            }
+            Span.fromContextOrNull(Context.current())?.let {
+                addExtension(
+                    TraceParent(
+                        it.spanContext.traceId,
+                        it.spanContext.spanId,
+                        it.spanContext.traceFlags.asHex()
+                    )
+                )
+            }
+        }
+
+        jingleIqRequestHandler.registerSession(this)
+        JingleStats.stanzaSent(sessionInitiate.action)
+        val response = connection.sendIqAndGetResponse(sessionInitiate)
+        // We treat a timeout (null) as success. This prevents failures in case the client delays processing, observed
+        // when joining a large conference. The session will be pending until we receive session-accept.
+        return if (response == null || response.type == IQ.Type.result) {
+            true
+        } else {
+            logger.error("Unexpected response to session-initiate: $response")
+            false
+        }
+    }
+
+    private fun createAddSourceIq(sources: ConferenceSourceMap) = JingleIQ(JingleAction.SOURCEADD, sid).apply {
+        from = localJid
+        type = IQ.Type.set
+        to = remoteJid
+        if (encodeSourcesAsJson) {
+            addExtension(sources.toJsonMessageExtension())
+        } else {
+            sources.toJingle().forEach { addContent(it) }
+        }
+    }
+
+    fun debugState(): ObjectNode = JsonNodeFactory.instance.objectNode().apply {
+        put("sid", sid)
+        put("remoteJid", remoteJid.toString())
+        put("state", state.toString())
+        put("client_version", clientVersion)
+    }
+
+    enum class State { PENDING, ACTIVE, ENDED }
+}
+
+/**
+ * Encodes the sources described in `sources` as a [JsonMessageExtension] in the compact JSON format
+ * (see [ConferenceSourceMap.compactJson]).
+ * @return the [JsonMessageExtension] encoding `sources`.
+ */
+fun ConferenceSourceMap.toJsonMessageExtension() = JsonMessageExtension("{\"sources\":${compactJson()}}")
+
+/**
+ * Encodes the sources described in `sources` in the list of Jingle contents. If necessary, new
+ * [ContentPacketExtension]s are created. Returns the resulting list of [ContentPacketExtension] which
+ * contains the encoded sources.
+ *
+ * @return the resulting list of [ContentPacketExtension], which consists of `contents` plus any new
+ * [ContentPacketExtension]s that were created.
+ */
+private fun ConferenceSourceMap.toContents(
+    /** The list of existing [ContentPacketExtension] to which to add sources if possible. */
+    existingContents: List<ContentPacketExtension>
+): List<ContentPacketExtension> {
+    val ret = mutableListOf<ContentPacketExtension>()
+    var audioContent = existingContents.find { it.name == "audio" }
+    var videoContent = existingContents.find { it.name == "video" }
+
+    audioContent?.let { ret.add(it) }
+    videoContent?.let { ret.add(it) }
+
+    val audioSourceExtensions = createSourcePacketExtensions(MediaType.AUDIO)
+    val audioSsrcGroupExtensions = createSourceGroupPacketExtensions(MediaType.AUDIO)
+    if (audioSourceExtensions.isNotEmpty() || audioSsrcGroupExtensions.isNotEmpty()) {
+        if (audioContent == null) {
+            audioContent = ContentPacketExtension().apply { name = "audio" }
+            ret.add(audioContent)
+        }
+        var audioDescription = audioContent.getFirstChildOfType(RtpDescriptionPacketExtension::class.java)
+        if (audioDescription == null) {
+            audioDescription = RtpDescriptionPacketExtension().apply { media = "audio" }
+            audioContent.addChildExtension(audioDescription)
+        }
+        for (extension in audioSourceExtensions) {
+            audioDescription.addChildExtension(extension)
+        }
+        for (extension in audioSsrcGroupExtensions) {
+            audioDescription.addChildExtension(extension)
+        }
+    }
+
+    val videoSourceExtensions = createSourcePacketExtensions(MediaType.VIDEO)
+    val videoSsrcGroupExtensions = createSourceGroupPacketExtensions(MediaType.VIDEO)
+    if (videoSourceExtensions.isNotEmpty() || videoSsrcGroupExtensions.isNotEmpty()) {
+        if (videoContent == null) {
+            videoContent = ContentPacketExtension().apply { name = "video" }
+            ret.add(videoContent)
+        }
+        var videoDescription = videoContent.getFirstChildOfType(RtpDescriptionPacketExtension::class.java)
+        if (videoDescription == null) {
+            videoDescription = RtpDescriptionPacketExtension().apply { media = "video" }
+            videoContent.addChildExtension(videoDescription)
+        }
+        for (extension in videoSourceExtensions) {
+            videoDescription.addChildExtension(extension)
+        }
+        for (extension in videoSsrcGroupExtensions) {
+            videoDescription.addChildExtension(extension)
+        }
+    }
+    return ret
+}

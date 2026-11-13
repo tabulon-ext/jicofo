@@ -1,0 +1,79 @@
+/*
+ * Jicofo, the Jitsi Conference Focus.
+ *
+ * Copyright @ 2021 - present 8x8, Inc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.jitsi.jicofo.bridge.colibri
+
+import com.fasterxml.jackson.databind.node.JsonNodeFactory
+import com.fasterxml.jackson.databind.node.ObjectNode
+import org.jitsi.xmpp.extensions.jingle.IceUdpTransportPacketExtension
+
+/**
+ * Represents the information for a specific participant/endpoint needed for colibri2.
+ */
+class ParticipantInfo(
+    parameters: ParticipantAllocationParameters,
+    var session: Colibri2Session
+) {
+    val id = parameters.id
+    val statsId = parameters.statsId
+    val useSctp = parameters.useSctp
+    val medias = parameters.medias
+    val supportsPrivateAddresses = parameters.supportsPrivateAddresses
+    val useSsrcRewriting = parameters.useSsrcRewriting
+    val useRtpMidDemux = parameters.useRtpMidDemux
+    val visitor = parameters.visitor
+    val diarize = parameters.diarize
+    val synthetic = parameters.synthetic
+
+    var audioMuted = parameters.forceMuteAudio
+    var videoMuted = parameters.forceMuteVideo
+    var sources = parameters.sources
+
+    /**
+     * The `ice-generation` of the most recent ICE restart for which we relayed the bridge's rotated transport
+     * back to this participant, used to discard responses that arrive out of order. See
+     * [ColibriV2SessionManager.endpointIceRestarted]. Guarded by the session manager's lock.
+     */
+    var lastRelayedIceGeneration = IceUdpTransportPacketExtension.GENERATION_UNSPECIFIED
+
+    /**
+     * The `ice-generation` of the most recent ICE restart whose answer we have already forwarded to the bridge,
+     * so that only the first set of new credentials of a round is tagged. See
+     * [ColibriV2SessionManager.stampIceGeneration]. Guarded by the session manager's lock.
+     */
+    var lastAnsweredIceGeneration = IceUdpTransportPacketExtension.GENERATION_UNSPECIFIED
+
+    /**
+     * The ICE ufrag of the last transport we forwarded to the bridge for this participant. The answer to an ICE
+     * restart is recognized by carrying credentials which are not these. Guarded by the session manager's lock.
+     */
+    var lastSignaledIceUfrag: String? = null
+
+    fun toJson(): ObjectNode = JsonNodeFactory.instance.objectNode().apply {
+        put("id", id)
+        put("stats_id", statsId.toString())
+        set<ObjectNode>("sources", sources.toJson())
+        put("bridge", session.bridge.jid.resourceOrNull.toString())
+        put("audio_muted", audioMuted)
+        put("video_muted", videoMuted)
+        put("private_addresses", supportsPrivateAddresses)
+        put("ssrc_rewriting", useSsrcRewriting)
+        put("rtp_mid_demux", useRtpMidDemux)
+        put("visitor", visitor)
+        put("diarize", diarize)
+    }
+}
